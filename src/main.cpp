@@ -8,8 +8,18 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-const char* ssid = "1812";
-const char* password = "1q2w3e4r5t";
+const char* ssid = "TP-Link_ECB8";
+const char* password = "06309794";
+
+bool running = false;
+int top;
+int down;
+int cycles;
+
+float temp = 0;
+bool lowered = false;
+int currentCycle;
+bool aborted = false;
 
 void connectToWifi() {
   WiFi.begin(ssid, password);
@@ -26,11 +36,78 @@ void initFireBase() {
   config.api_key = "AIzaSyARw8quvcK1eZjJurgsHYGEeIHFa3cfIoY";
   auth.user.email = "esp32@test.com";
   auth.user.password = "test13";
-
   config.token_status_callback = tokenStatusCallback;
-
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
+}
+
+void getData() {
+  if (Firebase.getJSON(fbdo, "/current")) {
+      if (fbdo.dataType() == "json") {
+        FirebaseJson &json = fbdo.to<FirebaseJson>();
+        FirebaseJsonData res;
+        json.get(res, "running");
+        if (res.success) {
+          running = res.to<bool>();
+        }
+        json.get(res, "top");
+        if (res.success) {
+          top = res.to<int>();
+        }
+        json.get(res, "down");
+        if (res.success) {
+          down = res.to<int>();
+        }
+        json.get(res, "cycles");
+        if (res.success) {
+          cycles = res.to<int>();
+        }
+      }
+    } else {
+      Serial.print("Ошибка получения данных: ");
+      Serial.println(fbdo.errorReason());
+    }
+}
+
+void sendData() {
+  //Отмечаем, что esp подключена
+  if (Firebase.setBoolAsync(fbdo, "current/connected", true)) {
+    Serial.println("connected установлено в true");
+  } else {
+    Serial.print("Ошибка при отправке connected: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  if (Firebase.setFloatAsync(fbdo, "current/temp", temp)) {
+    Serial.println("Температура отправлена");
+  } else {
+    Serial.print("Ошибка при отправке данных температуры: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  if (Firebase.setBoolAsync(fbdo, "current/lowered", lowered)) {
+    Serial.println("Положение отправлено");
+  } else {
+    Serial.print("Ошибка при отправке данных положения: ");
+    Serial.println(fbdo.errorReason());
+  }
+  
+  if (Firebase.setIntAsync(fbdo, "current/currentCycle", currentCycle)) {
+    Serial.println("Текущий цикл отправлен");
+  } else {
+    Serial.print("Ошибка при отправке данных текущего цикла: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  if (aborted) {
+    Serial.println("Процесс прерван");
+    if (Firebase.setBoolAsync(fbdo, "current/aborted", aborted)) {
+      Serial.println("Отправлено оповещение о прерывании процесса");
+    } else {
+      Serial.print("Ошибка при отправке оповещения о прерывании процесса: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
 }
 
 void setup() {
@@ -43,20 +120,31 @@ void setup() {
 int timer;
 
 void loop() {
+  if (millis() < timer) {
+    timer = 0;
+  }
   if (millis() - timer > 500 && Firebase.ready()) {
-    if (Firebase.getBool(fbdo, "/led")) {
-      if  (fbdo.dataType() == "boolean") {
-        int led = fbdo.boolData();
-        if (led) {
-          digitalWrite(21, HIGH);
-        } else {
-          digitalWrite(21, LOW);
-        }
-        Serial.println(led);
-      }
+
+    getData();
+    Serial.print(running);
+    Serial.print(" ");
+    Serial.print(top);
+    Serial.print(" ");
+    Serial.print(down);
+    Serial.print(" ");
+    Serial.println(cycles);
+
+    if (running) {
+      digitalWrite(21, HIGH);
     } else {
-      Serial.println(fbdo.errorReason());
+      digitalWrite(21, LOW);
     }
+
+    temp += 0.3;
+    lowered = !lowered;
+    currentCycle += 1;
+
+    sendData();
 
     timer = millis();
   }
