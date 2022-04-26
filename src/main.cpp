@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
 #include <FirebaseESP32.h>
 #include <addons/TokenHelper.h>
 #include <addons/RTDBHelper.h>
@@ -8,8 +10,13 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-const char* ssid = "TP-Link_ECB8";
-const char* password = "06309794";
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
+
+const char* ssid = "1812";
+const char* password = "1q2w3e4r5t";
+
+bool ready = false;
 
 bool running = false;
 int top;
@@ -20,6 +27,14 @@ float temp = 0;
 bool lowered = false;
 int currentCycle;
 bool aborted = false;
+
+//0 - выключен 1 - опускается
+//2 - внизу 3 - поднимается
+//4 - вверху
+int state = 0;
+bool moving = false;
+int currentTime;
+int targetTime;
 
 void connectToWifi() {
   WiFi.begin(ssid, password);
@@ -69,7 +84,7 @@ void getData() {
     }
 }
 
-void sendData() {
+void heartbeat() {
   //Отмечаем, что esp подключена
   if (Firebase.setBoolAsync(fbdo, "current/connected", true)) {
     Serial.println("connected установлено в true");
@@ -77,7 +92,9 @@ void sendData() {
     Serial.print("Ошибка при отправке connected: ");
     Serial.println(fbdo.errorReason());
   }
+}
 
+void sendData() {
   if (Firebase.setFloatAsync(fbdo, "current/temp", temp)) {
     Serial.println("Температура отправлена");
   } else {
@@ -99,14 +116,11 @@ void sendData() {
     Serial.println(fbdo.errorReason());
   }
 
-  if (aborted) {
-    Serial.println("Процесс прерван");
-    if (Firebase.setBoolAsync(fbdo, "current/aborted", aborted)) {
-      Serial.println("Отправлено оповещение о прерывании процесса");
-    } else {
-      Serial.print("Ошибка при отправке оповещения о прерывании процесса: ");
-      Serial.println(fbdo.errorReason());
-    }
+  if (Firebase.setIntAsync(fbdo, "current/currentTime", currentTime)) {
+    Serial.println("Текущее время отправлено");
+  } else {
+    Serial.print("Ошибка при отправке данных текущего времени: ");
+    Serial.println(fbdo.errorReason());
   }
 }
 
@@ -115,6 +129,7 @@ void setup() {
   connectToWifi();
   initFireBase();
   pinMode(21, OUTPUT);
+  timeClient.begin();
 }
 
 int timer;
@@ -123,28 +138,109 @@ void loop() {
   if (millis() < timer) {
     timer = 0;
   }
-  if (millis() - timer > 500 && Firebase.ready()) {
+  if (millis() - timer > 1000 && Firebase.ready()) {
+    heartbeat();
+    timeClient.update(); //обновляем время
+    currentTime = timeClient.getEpochTime();
 
     getData();
-    Serial.print(running);
-    Serial.print(" ");
-    Serial.print(top);
-    Serial.print(" ");
-    Serial.print(down);
-    Serial.print(" ");
-    Serial.println(cycles);
 
+
+
+    //Если сразу же после включения процесс запущен, значит он прервался
+    if (running && !ready) {
+      running = false;
+      if (Firebase.setBoolAsync(fbdo, "current/running", false)) {
+        Serial.println("Предыдущий процесс прерван");
+      } else {
+        Serial.print("Ошибка при прерывании предыдущего процесса: ");
+        Serial.println(fbdo.errorReason());
+      }
+      if (Firebase.setBoolAsync(fbdo, "current/aborted", true)) {
+        Serial.println("Предыдущий процесс прерван");
+      } else {
+        Serial.print("Ошибка при прерывании предыдущего процесса: ");
+        Serial.println(fbdo.errorReason());
+      }
+      if (Firebase.setStringAsync(fbdo, "current/abortReason", "Прерван из-за отключения питания")) {
+        Serial.println("Причина прерывания отправлена");
+      } else {
+        Serial.print("Ошибка при отправке причины прерывания: ");
+        Serial.println(fbdo.errorReason());
+      }
+    } else {
+      ready = true;
+    }
+
+
+
+    //прерывание из приложения
+    if (!running) {
+      if (state < 3) {
+        //функция для подъёма
+      }
+      if (state > 0) {
+        state = 0;
+      }
+    }
+
+
+
+    if (running && state == 0) {
+      state = 1;
+      //функция для опускания
+    }
+    if (state == 1 && !moving) {
+      state = 2;
+      targetTime = currentTime + down;
+    }
+    if (state == 2 && currentTime >= targetTime) {
+      state = 3;
+      //функция для подъёма
+    }
+    if (state == 3 && !moving) {
+      state = 4;
+      targetTime = currentTime + top;
+    }
+    if (state == 4 && currentTime >= targetTime) {
+      state = 0;
+      currentCycle++;
+      if (currentCycle >= cycles) {
+        running = false;
+        //отмечаем что процесс завершён
+        //возможно меняем время завершения
+      }
+    }
+
+
+
+    //////////
     if (running) {
       digitalWrite(21, HIGH);
     } else {
       digitalWrite(21, LOW);
     }
+    Serial.println(state);
+    //////////
 
-    temp += 0.3;
-    lowered = !lowered;
-    currentCycle += 1;
 
-    sendData();
+    //Сработал один из датчиков холла
+    if (digitalRead(1)) {
+      moving = false;
+      lowered = true;
+    }
+    if (digitalRead(2)) {
+      moving = false;
+      lowered = false;
+    }
+
+
+
+    if (running) { //возможно температуру стоит отправлять и до запуска, если процесс !comleted
+      sendData();
+    }
+
+    
 
     timer = millis();
   }
