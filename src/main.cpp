@@ -6,9 +6,9 @@
 #include <addons/TokenHelper.h>
 #include <addons/RTDBHelper.h>
 
-FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
+FirebaseData fbdo;
 
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP);
@@ -16,27 +16,32 @@ NTPClient timeClient(ntpUDP);
 const char* ssid = "1812";
 const char* password = "1q2w3e4r5t";
 
-bool ready = false;
-
-bool running = false;
-int top;
-int down;
-int cycles;
-
-float temp = 0;
-bool lowered = false;
-int currentCycle;
-bool aborted = false;
-
-//0 - выключен 1 - опускается
-//2 - внизу 3 - поднимается
-//4 - вверху
-int state = 0;
-bool moving = false;
+bool ready;
+bool moving;
+bool lowered;
+int state = 0; // 0 - начало вверху 1 - опускается 2 - внизу 3 - поднимается 4 - вверху
+int completedCycles;
 int currentTime;
 int targetTime;
+float temp = 0;
 
-void connectToWifi() {
+struct ProcessInfo {
+  bool running;
+  bool completed;
+  // bool aborted;
+  int top;
+  int down;
+  int cycles;
+  // int start;
+  // int finish;
+  // char* name;
+  // char* abortReason;
+  // char* description;
+} processInfo;
+
+int timer;
+
+void connectToWifi() { //нужно переделать!
   WiFi.begin(ssid, password);
   Serial.print("Connection to wi-fi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -46,7 +51,7 @@ void connectToWifi() {
   Serial.println("connected");
 }
 
-void initFireBase() {
+void initFirebase() {
   config.host = "https://rust-74e51-default-rtdb.europe-west1.firebasedatabase.app";
   config.api_key = "AIzaSyARw8quvcK1eZjJurgsHYGEeIHFa3cfIoY";
   auth.user.email = "esp32@test.com";
@@ -56,126 +61,115 @@ void initFireBase() {
   Firebase.reconnectWiFi(true);
 }
 
-void getData() {
-  if (Firebase.getJSON(fbdo, "/current")) {
-      if (fbdo.dataType() == "json") {
-        FirebaseJson &json = fbdo.to<FirebaseJson>();
-        FirebaseJsonData res;
-        json.get(res, "running");
-        if (res.success) {
-          running = res.to<bool>();
-        }
-        json.get(res, "top");
-        if (res.success) {
-          top = res.to<int>();
-        }
-        json.get(res, "down");
-        if (res.success) {
-          down = res.to<int>();
-        }
-        json.get(res, "cycles");
-        if (res.success) {
-          cycles = res.to<int>();
-        }
-      }
-    } else {
-      Serial.print("Ошибка получения данных: ");
-      Serial.println(fbdo.errorReason());
-    }
+void heartbeat() { //Отмечаем, что esp подключена
+  if (!Firebase.setBoolAsync(fbdo, "current/connected", true)) 
+    Serial.print("Ошибка оповещении о подключении: " + fbdo.errorReason());
 }
 
-void heartbeat() {
-  //Отмечаем, что esp подключена
-  if (Firebase.setBoolAsync(fbdo, "current/connected", true)) {
-    Serial.println("connected установлено в true");
+void getData() {
+  if (Firebase.getJSON(fbdo, "/current")) {
+    if (fbdo.dataType() == "json") {
+      FirebaseJson &json = fbdo.to<FirebaseJson>();
+      FirebaseJsonData res;
+      json.get(res, "running");
+      if (res.success)
+        processInfo.running = res.to<bool>();
+      json.get(res, "completed");
+      if (res.success)
+        processInfo.completed = res.to<bool>();
+      json.get(res, "top");
+      if (res.success)
+        processInfo.top = res.to<int>();
+      json.get(res, "down");
+      if (res.success)
+        processInfo.down = res.to<int>();
+      json.get(res, "cycles");
+      if (res.success)
+        processInfo.cycles = res.to<int>();
+    }
   } else {
-    Serial.print("Ошибка при отправке connected: ");
-    Serial.println(fbdo.errorReason());
+    Serial.print("Ошибка получения данных: " + fbdo.errorReason());
   }
 }
 
 void sendData() {
-  if (Firebase.setFloatAsync(fbdo, "current/temp", temp)) {
-    Serial.println("Температура отправлена");
-  } else {
-    Serial.print("Ошибка при отправке данных температуры: ");
-    Serial.println(fbdo.errorReason());
-  }
+  if (!Firebase.setIntAsync(fbdo, "current/currentTime", currentTime))
+    Serial.print("Ошибка при отправке данных текущего времени: " + fbdo.errorReason());
+  if (!Firebase.setIntAsync(fbdo, "current/completedCycles", completedCycles))
+    Serial.print("Ошибка при отправке данных текущего цикла: " + fbdo.errorReason());
+  if (!Firebase.setBoolAsync(fbdo, "current/lowered", lowered))
+    Serial.print("Ошибка при отправке данных положения: " + fbdo.errorReason());
+}
 
-  if (Firebase.setBoolAsync(fbdo, "current/lowered", lowered)) {
-    Serial.println("Положение отправлено");
-  } else {
-    Serial.print("Ошибка при отправке данных положения: ");
-    Serial.println(fbdo.errorReason());
-  }
-  
-  if (Firebase.setIntAsync(fbdo, "current/currentCycle", currentCycle)) {
-    Serial.println("Текущий цикл отправлен");
-  } else {
-    Serial.print("Ошибка при отправке данных текущего цикла: ");
-    Serial.println(fbdo.errorReason());
-  }
+void completeProcess() {
+  processInfo.running = false;
+  Firebase.setBoolAsync(fbdo, "current/running", false);
+  Firebase.setBoolAsync(fbdo, "current/completed", true);
+  Serial.println(F("Процесс завершён"));
+}
 
-  if (Firebase.setIntAsync(fbdo, "current/currentTime", currentTime)) {
-    Serial.println("Текущее время отправлено");
-  } else {
-    Serial.print("Ошибка при отправке данных текущего времени: ");
-    Serial.println(fbdo.errorReason());
+void abortProcess(const char* reason) {
+  processInfo.running = false;
+  Firebase.setBoolAsync(fbdo, "current/running", false);
+  Firebase.setBoolAsync(fbdo, "current/aborted", true);
+  Firebase.setStringAsync(fbdo, "current/abortReason", reason);
+  Serial.println(reason);
+}
+
+void processLoop() {
+  if (processInfo.running && state == 0) {
+    state = 1;
+    //функция для опускания
+    Serial.println(F("Процесс запущен"));
+  }
+  if (state == 1 && !moving) {
+    state = 2;
+    targetTime = currentTime + processInfo.down;
+  }
+  if (state == 2 && currentTime >= targetTime) {
+    state = 3;
+    //функция для подъёма
+  }
+  if (state == 3 && !moving) {
+    state = 4;
+    targetTime = currentTime + processInfo.top;
+  }
+  if (state == 4 && currentTime >= targetTime) {
+    completedCycles++;
+    Serial.println(String(completedCycles) + " цикл завершён");
+    if (completedCycles >= processInfo.cycles) {
+      state = 0;
+      completeProcess();
+      sendData();
+    } else {
+      state = 1;
+      //функция для опускания
+    }
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  connectToWifi();
-  initFireBase();
   pinMode(21, OUTPUT);
+  connectToWifi();
+  initFirebase();
   timeClient.begin();
 }
 
-int timer;
-
 void loop() {
-  if (millis() < timer) {
-    timer = 0;
-  }
-  if (millis() - timer > 1000 && Firebase.ready()) {
-    heartbeat();
-    timeClient.update(); //обновляем время
+  if (millis() < timer) timer = 0;
+
+  if (Firebase.ready() && millis() - timer > 1000) {
+    timeClient.update();
     currentTime = timeClient.getEpochTime();
+
+    heartbeat();
 
     getData();
 
-
-
-    //Если сразу же после включения процесс запущен, значит он прервался
-    if (running && !ready) {
-      running = false;
-      if (Firebase.setBoolAsync(fbdo, "current/running", false)) {
-        Serial.println("Предыдущий процесс прерван");
-      } else {
-        Serial.print("Ошибка при прерывании предыдущего процесса: ");
-        Serial.println(fbdo.errorReason());
-      }
-      if (Firebase.setBoolAsync(fbdo, "current/aborted", true)) {
-        Serial.println("Предыдущий процесс прерван");
-      } else {
-        Serial.print("Ошибка при прерывании предыдущего процесса: ");
-        Serial.println(fbdo.errorReason());
-      }
-      if (Firebase.setStringAsync(fbdo, "current/abortReason", "Прерван из-за отключения питания")) {
-        Serial.println("Причина прерывания отправлена");
-      } else {
-        Serial.print("Ошибка при отправке причины прерывания: ");
-        Serial.println(fbdo.errorReason());
-      }
-    } else {
-      ready = true;
-    }
-
-
-
     //прерывание из приложения
-    if (!running) {
+    if (!processInfo.running && state > 0) {
+      Serial.println(F("Процесс прерван из приложения"));
       if (state < 3) {
         //функция для подъёма
       }
@@ -184,45 +178,25 @@ void loop() {
       }
     }
 
+    //Если сразу же после включения процесс запущен, значит он прервался
+    //Возможно это лучше сделать в сетапе, но не точно!
+    if (!ready && processInfo.running)
+      abortProcess("Прерван из-за отключения питания");
+    else if (!ready)
+      ready = true;
 
-
-    if (running && state == 0) {
-      state = 1;
-      //функция для опускания
-    }
-    if (state == 1 && !moving) {
-      state = 2;
-      targetTime = currentTime + down;
-    }
-    if (state == 2 && currentTime >= targetTime) {
-      state = 3;
-      //функция для подъёма
-    }
-    if (state == 3 && !moving) {
-      state = 4;
-      targetTime = currentTime + top;
-    }
-    if (state == 4 && currentTime >= targetTime) {
-      state = 0;
-      currentCycle++;
-      if (currentCycle >= cycles) {
-        running = false;
-        //отмечаем что процесс завершён
-        //возможно меняем время завершения
-      }
+    if (!processInfo.completed) {
+      if (Firebase.setFloatAsync(fbdo, "current/temp", temp))
+        Serial.println("Температура отправлена");
+      else
+        Serial.print("Ошибка при отправке данных температуры: " + fbdo.errorReason());
     }
 
+    processLoop();
 
-
-    //////////
-    if (running) {
-      digitalWrite(21, HIGH);
-    } else {
-      digitalWrite(21, LOW);
+    if (processInfo.running) {
+      sendData();
     }
-    Serial.println(state);
-    //////////
-
 
     //Сработал один из датчиков холла
     if (digitalRead(1)) {
@@ -233,14 +207,6 @@ void loop() {
       moving = false;
       lowered = false;
     }
-
-
-
-    if (running) { //возможно температуру стоит отправлять и до запуска, если процесс !comleted
-      sendData();
-    }
-
-    
 
     timer = millis();
   }
