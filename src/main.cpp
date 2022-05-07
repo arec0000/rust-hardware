@@ -13,15 +13,19 @@ FirebaseData fbdo;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP);
 
-const char* ssid = "1812";
-const char* password = "1q2w3e4r5t";
+const char* ssid = "...";
+const char* password = "20031983";
 
 bool ready;
+bool onInitialize;
+bool inited;
+int initMoment;
+
 bool moving;
 bool lowered;
 int state = 0; // 0 - начало вверху 1 - опускается 2 - внизу 3 - поднимается 4 - вверху
 int completedCycles;
-int currentTime;
+int currentTime; //поменять на lastRunningTime или можно просто менять finish при завершении
 int targetTime;
 float temp = 0;
 
@@ -41,16 +45,6 @@ struct ProcessInfo {
 
 int timer;
 
-void connectToWifi() { //нужно переделать!
-  WiFi.begin(ssid, password);
-  Serial.print("Connection to wi-fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("connected");
-}
-
 void initFirebase() {
   config.host = "https://rust-74e51-default-rtdb.europe-west1.firebasedatabase.app";
   config.api_key = "AIzaSyARw8quvcK1eZjJurgsHYGEeIHFa3cfIoY";
@@ -63,9 +57,12 @@ void initFirebase() {
 
 void heartbeat() { //Отмечаем, что esp подключена
   if (!Firebase.setBoolAsync(fbdo, "current/connected", true)) 
-    Serial.print("Ошибка оповещении о подключении: " + fbdo.errorReason());
+    Serial.println("Ошибка оповещении о подключении: " + fbdo.errorReason());
 }
 
+
+//нужно разобраться как подписаться на изменения, не запрашивать если ничего не поменялось
+//ну и в начале запросить
 void getData() {
   if (Firebase.getJSON(fbdo, "/current")) {
     if (fbdo.dataType() == "json") {
@@ -88,17 +85,17 @@ void getData() {
         processInfo.cycles = res.to<int>();
     }
   } else {
-    Serial.print("Ошибка получения данных: " + fbdo.errorReason());
+    Serial.println("Ошибка получения данных: " + fbdo.errorReason());
   }
 }
 
 void sendData() {
   if (!Firebase.setIntAsync(fbdo, "current/currentTime", currentTime))
-    Serial.print("Ошибка при отправке данных текущего времени: " + fbdo.errorReason());
+    Serial.println("Ошибка при отправке данных текущего времени: " + fbdo.errorReason());
   if (!Firebase.setIntAsync(fbdo, "current/completedCycles", completedCycles))
-    Serial.print("Ошибка при отправке данных текущего цикла: " + fbdo.errorReason());
+    Serial.println("Ошибка при отправке данных текущего цикла: " + fbdo.errorReason());
   if (!Firebase.setBoolAsync(fbdo, "current/lowered", lowered))
-    Serial.print("Ошибка при отправке данных положения: " + fbdo.errorReason());
+    Serial.println("Ошибка при отправке данных положения: " + fbdo.errorReason());
 }
 
 void completeProcess() {
@@ -148,64 +145,105 @@ void processLoop() {
   }
 }
 
+void onWifiConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.println(F("Подключено к wifi установлено"));
+  if (!inited) {
+    onInitialize = true;
+    initMoment = millis();
+  } else {
+    sendData();
+  }
+}
+
+void onWifiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.println(F("Соединение с wifi разорвано, переподключение.."));
+  if (!inited) onInitialize = false;
+  WiFi.begin(ssid, password);
+}
+
+void initWifi() {
+  WiFi.setAutoReconnect(true);
+  WiFi.setAutoConnect(true);
+  WiFi.persistent(true);
+  WiFi.onEvent(onWifiConnected, SYSTEM_EVENT_STA_CONNECTED);
+  WiFi.onEvent(onWifiDisconnected, SYSTEM_EVENT_STA_DISCONNECTED);
+  WiFi.begin(ssid, password);
+  Serial.println(F("Подключение к wifi.."));
+}
+
+void initServices() {
+  Serial.println(F("Инициализации служб"));
+  initFirebase();
+  timeClient.begin();
+  onInitialize = false;
+  inited = true;
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(21, OUTPUT);
-  connectToWifi();
-  initFirebase();
-  timeClient.begin();
+  initWifi();
+  //едем вверх
 }
 
 void loop() {
-  if (millis() < timer) timer = 0;
+  if (millis() < timer) timer = 0; //сбрасываем таймер вместе с millis
 
-  if (Firebase.ready() && millis() - timer > 1000) {
-    timeClient.update();
-    currentTime = timeClient.getEpochTime();
+  if (millis() - timer > 1000) {
+    Serial.println(millis());
 
-    heartbeat();
+    if (WiFi.status() == WL_CONNECTED) {
 
-    getData();
+      if (!inited && onInitialize && millis() - initMoment > 500)
+        initServices();
 
-    //прерывание из приложения
-    if (!processInfo.running && state > 0) {
-      Serial.println(F("Процесс прерван из приложения"));
-      if (state < 3) {
-        //функция для подъёма
+      //костыль, чтобы время при обрыве связи отправилось не текущее время, а время завершения
+      if (processInfo.running) {
+        timeClient.update();
+        currentTime = timeClient.getEpochTime();
       }
-      if (state > 0) {
-        state = 0;
+
+      if (Firebase.ready()) {
+
+        heartbeat();
+        getData();
+
+        if (!ready && processInfo.running) 
+          abortProcess("Прерван из-за отключения питания");
+        else if (!ready) 
+          ready = true;
+
+        if (!processInfo.running && state > 0) {
+          Serial.println(F("Процесс прерван из приложения"));
+          if (state < 3) {
+            //функция для подъёма
+          }
+          if (state > 0) state = 0;
+        }
+
+        if (!processInfo.completed) {
+          if (Firebase.setFloatAsync(fbdo, "current/temp", temp))
+            Serial.println("Температура отправлена");
+          else
+            Serial.print("Ошибка при отправке данных температуры: " + fbdo.errorReason());
+        }
+
+        processLoop();
+
+        if (processInfo.running) {
+          sendData();
+        }
+
+        //Сработал один из датчиков холла, здесь можно отправлять lowered, если запущен или движется
+        // if (digitalRead(1)) {
+        //   moving = false;
+        //   lowered = true;
+        // }
+        // if (digitalRead(2)) {
+        //   moving = false;
+        //   lowered = false;
+        // }
       }
-    }
-
-    //Если сразу же после включения процесс запущен, значит он прервался
-    //Возможно это лучше сделать в сетапе, но не точно!
-    if (!ready && processInfo.running)
-      abortProcess("Прерван из-за отключения питания");
-    else if (!ready)
-      ready = true;
-
-    if (!processInfo.completed) {
-      if (Firebase.setFloatAsync(fbdo, "current/temp", temp))
-        Serial.println("Температура отправлена");
-      else
-        Serial.print("Ошибка при отправке данных температуры: " + fbdo.errorReason());
-    }
-
-    processLoop();
-
-    if (processInfo.running) {
-      sendData();
-    }
-
-    //Сработал один из датчиков холла
-    if (digitalRead(1)) {
-      moving = false;
-      lowered = true;
-    }
-    if (digitalRead(2)) {
-      moving = false;
-      lowered = false;
     }
 
     timer = millis();
